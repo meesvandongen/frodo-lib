@@ -15,7 +15,7 @@ import {
   stopProgressIndicator,
 } from './utils/Console';
 import { getTypedFilename } from './utils/ExportImportUtils';
-import { readFilesRecursive, unSubstituteEnvParams } from './utils/OpsUtils';
+import { readFiles, unSubstituteEnvParams } from './utils/OpsUtils';
 import path from 'path';
 import { validateScriptHooks } from './utils/ValidationUtils';
 
@@ -102,7 +102,7 @@ export async function exportAllRawConfigEntities(directory) {
           ) {
             printMessage(getConfigEntityError.response?.data, 'error');
             printMessage(
-              `Error getting config entity: ${getConfigEntityError}`,
+              `Error getting config entity ${x._id}: ${getConfigEntityError}`,
               'error'
             );
           }
@@ -196,7 +196,7 @@ export async function exportAllConfigEntities(
             });
             fse.outputFile(
               `${directory}/${item._id}.json`,
-              JSON.stringify(item, null, 2),
+              configEntityString,
               // eslint-disable-next-line consistent-return
               (error) => {
                 if (err) {
@@ -249,6 +249,7 @@ export async function importConfigEntity(
 /**
  * Import all IDM configuration objects from separate JSON files in a directory specified by <directory>
  * @param baseDirectory export directory
+ * @param validate validate script hooks
  */
 export async function importAllRawConfigEntities(
   baseDirectory: string,
@@ -257,23 +258,28 @@ export async function importAllRawConfigEntities(
   if (!fs.existsSync(baseDirectory)) {
     return;
   }
-  const files = await readFilesRecursive(baseDirectory);
+  const files = await readFiles(baseDirectory);
   const jsonFiles = files
-    .filter((file) => file.toLowerCase().endsWith('.json'))
-    .map((filePath) => ({
+    .filter(({ path }) => path.toLowerCase().endsWith('.json'))
+    .map(({ path, content }) => ({
       // Remove .json extension
-      entityId: filePath.substring(0, filePath.length - 5),
-      content: fs.readFileSync(filePath, 'utf8'),
-      path: filePath,
+      entityId: path.substring(0, path.length - 5),
+      content,
+      path,
     }));
 
+  let everyScriptValid = true;
   for (const file of jsonFiles) {
     const jsObject = JSON.parse(file.content);
-    const isValid = validateScriptHooks(jsObject);
-    if (validate && !isValid) {
+    const isScriptValid = validateScriptHooks(jsObject);
+    if (!isScriptValid) {
       printMessage(`Invalid script hook in ${file.path}`, 'error');
-      return;
+      everyScriptValid = false;
     }
+  }
+
+  if (validate && !everyScriptValid) {
+    return;
   }
 
   createProgressIndicator(
@@ -286,16 +292,39 @@ export async function importAllRawConfigEntities(
     return putConfigEntity(file.entityId, file.content);
   });
 
-  await Promise.all(entityPromises).then(() => {
-    stopProgressIndicator('Imported config objects.', 'success');
+  await Promise.allSettled(entityPromises).then((results) => {
+    const errors = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected'
+    );
+
+    if (errors.length > 0) {
+      printMessage(
+        `Failed to import ${errors.length} config objects:`,
+        'error'
+      );
+      errors.forEach((error) => {
+        printMessage(`- ${error.reason}`, 'error');
+      });
+      stopProgressIndicator(
+        `Failed to import ${errors.length} config objects`,
+        'error'
+      );
+      return;
+    }
+
+    stopProgressIndicator(
+      `Imported ${results.length} config objects`,
+      'success'
+    );
   });
 }
 
 /**
  * Import all IDM configuration objects
- * @param directory import directory
+ * @param baseDirectory import directory
  * @param entitiesFile JSON file that specifies the config entities to export/import
  * @param envFile File that defines environment specific variables for replacement during configuration export/import
+ * @param validate validate script hooks
  */
 export async function importAllConfigEntities(
   baseDirectory: string,
@@ -306,28 +335,32 @@ export async function importAllConfigEntities(
   if (!fs.existsSync(baseDirectory)) {
     return;
   }
-  const entities = JSON.parse(fs.readFileSync(entitiesFile, 'utf8'));
-  const entriesToImport = entities.idm;
+  const entriesToImport = JSON.parse(fs.readFileSync(entitiesFile, 'utf8')).idm;
 
-  const envParams = propertiesReader(envFile);
+  const envReader = propertiesReader(envFile);
 
-  const files = await readFilesRecursive(baseDirectory);
+  const files = await readFiles(baseDirectory);
   const jsonFiles = files
-    .filter((file) => file.toLowerCase().endsWith('.json'))
-    .map((filePath) => ({
+    .filter(({ path }) => path.toLowerCase().endsWith('.json'))
+    .map(({ content, path }) => ({
       // Remove .json extension
-      entityId: filePath.substring(0, filePath.length - 5),
-      content: fs.readFileSync(filePath, 'utf8'),
-      path: filePath,
+      entityId: path.substring(0, path.length - 5),
+      content,
+      path,
     }));
 
+  let everyScriptValid = true;
   for (const file of jsonFiles) {
     const jsObject = JSON.parse(file.content);
-    const isValid = validateScriptHooks(jsObject);
-    if (validate && !isValid) {
+    const isScriptValid = validateScriptHooks(jsObject);
+    if (!isScriptValid) {
       printMessage(`Invalid script hook in ${file.path}`, 'error');
-      return;
+      everyScriptValid = false;
     }
+  }
+
+  if (validate && !everyScriptValid) {
+    return;
   }
 
   createProgressIndicator(
@@ -341,12 +374,34 @@ export async function importAllConfigEntities(
       return entriesToImport.includes(entityId);
     })
     .map(({ entityId, content }) => {
-      const unsubstituted = unSubstituteEnvParams(content, envParams);
+      const unsubstituted = unSubstituteEnvParams(content, envReader);
       return putConfigEntity(entityId, unsubstituted);
     });
 
-  await Promise.all(entityPromises).then(() => {
-    stopProgressIndicator('Imported config objects.', 'success');
+  await Promise.allSettled(entityPromises).then((results) => {
+    const errors = results.filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected'
+    );
+
+    if (errors.length > 0) {
+      printMessage(
+        `Failed to import ${errors.length} config objects:`,
+        'error'
+      );
+      errors.forEach((error) => {
+        printMessage(`- ${error.reason}`, 'error');
+      });
+      stopProgressIndicator(
+        `Failed to import ${errors.length} config objects`,
+        'error'
+      );
+      return;
+    }
+
+    stopProgressIndicator(
+      `Imported ${results.length} config objects`,
+      'success'
+    );
   });
 }
 
